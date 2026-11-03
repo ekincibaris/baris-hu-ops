@@ -16,19 +16,21 @@ resource "aws_acm_certificate" "this" {
   }
 }
 
-resource "aws_route53_record" "validation" {
-  for_each = {
-    for dvo in aws_acm_certificate.this.domain_validation_options : dvo.domain_name => {
-      name   = dvo.resource_record_name
-      record = dvo.resource_record_value
-      type   = dvo.resource_record_type
-    }
+locals {
+  validation_options = {
+    for dvo in aws_acm_certificate.this.domain_validation_options : dvo.domain_name => dvo
   }
+}
+
+# Keyed by the (static) domain name rather than by the certificate's computed
+# attributes, so the plan never depends on values known only after apply.
+resource "aws_route53_record" "validation" {
+  for_each = toset([var.domain_name])
 
   zone_id         = var.zone_id
-  name            = each.value.name
-  type            = each.value.type
-  records         = [each.value.record]
+  name            = local.validation_options[each.key].resource_record_name
+  type            = local.validation_options[each.key].resource_record_type
+  records         = [local.validation_options[each.key].resource_record_value]
   ttl             = 60
   allow_overwrite = true
 }
