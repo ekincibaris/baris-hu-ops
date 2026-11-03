@@ -61,3 +61,8 @@ output "session_manager_hint" {
   description = "How to open a shell on an instance without SSH."
   value       = "aws ssm start-session --region ${var.region} --target $(aws autoscaling describe-auto-scaling-groups --region ${var.region} --auto-scaling-group-names ${module.compute.asg_name} --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)"
 }
+
+output "alb_access_log_bucket" {
+  description = "S3 bucket with ALB access logs (prefix alb/)."
+  value       = module.alb.access_log_bucket
+}
