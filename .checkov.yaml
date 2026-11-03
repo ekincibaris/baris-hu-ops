@@ -1,0 +1,14 @@
+# Checkov configuration. Findings are fixed in code or skipped inline with a
+# justification next to the resource (`#checkov:skip=<ID>:<reason>`), so every
+# exception is reviewed together with the code it applies to.
+directory:
+  - .
+framework:
+  - terraform
+  - github_actions
+  - secrets
+skip-path:
+  - \.terraform
+compact: true
+quiet: true
+download-external-modules: false

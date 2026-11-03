@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars (gitignored) and fill in. Never commit the real file.
+
+# Guardrail: the provider refuses to run against any other account.
+allowed_account_ids = ["123456789012"]
+
+# Receives alarm and auto-remediation emails. Confirm the SNS subscription
+# email after the first apply or no notifications are delivered.
+alarm_email = "alerts@example.com"
+
+# Existing public hosted zone and the record to create in it.
+hosted_zone_name = "baris.hu"
+domain_name      = "ops.baris.hu"
+
+# Cost switches (see README "Cost").
+# single_az_endpoints = true   # ~44 USD/month less; fine for an interview demo
+# enable_nat_gateway  = false  # endpoints already cover SSM, CloudWatch and dnf
+
+# Faster scale-out for a live demo (see docs/DEMO.md).
+# cpu_target_value = 40
+
+# If SSM-SessionManagerRunShell or the SSM Automation log settings are already
+# managed elsewhere in this account/region:
+# manage_session_manager_preferences = false
+# manage_automation_log_settings     = false
