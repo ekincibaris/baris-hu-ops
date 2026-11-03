@@ -1,0 +1,122 @@
+#!/bin/bash
+# Bootstraps the ops.baris.hu status page. Rendered by Terraform (templatefile)
+# and run once by cloud-init. No internet access is assumed: packages come from
+# the Amazon Linux 2023 repositories through the S3 gateway endpoint.
+set -euo pipefail
+exec > >(tee -a /var/log/user-data.log | logger -t user-data) 2>&1
+
+retry() {
+  local attempt=1
+  until "$@"; do
+    if [ "$attempt" -ge 5 ]; then
+      echo "giving up after $attempt attempts: $*"
+      return 1
+    fi
+    echo "attempt $attempt failed, retrying: $*"
+    sleep $((attempt * 10))
+    attempt=$((attempt + 1))
+  done
+}
+
+echo "user-data started at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# --- Instance identity from IMDSv2 ---------------------------------------------
+TOKEN=$(curl -sS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+imds() { curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/$1"; }
+INSTANCE_ID=$(imds instance-id)
+AZ=$(imds placement/availability-zone)
+INSTANCE_TYPE=$(imds instance-type)
+AMI_ID=$(imds ami-id)
+BOOTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# --- Packages ------------------------------------------------------------------
+retry dnf install -y nginx amazon-cloudwatch-agent
+
+# --- nginx ---------------------------------------------------------------------
+cat > /etc/nginx/nginx.conf <<'NGINX'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /run/nginx.pid;
+
+events {
+  worker_connections 1024;
+}
+
+http {
+  include /etc/nginx/mime.types;
+  default_type application/octet-stream;
+  log_format main '$remote_addr [$time_local] "$request" $status $body_bytes_sent '
+                  '"$http_user_agent" xff="$http_x_forwarded_for" rt=$request_time';
+  access_log /var/log/nginx/access.log main;
+  server_tokens off;
+  sendfile on;
+  keepalive_timeout 75; # longer than the ALB idle timeout (60 s)
+
+  server {
+    listen ${app_port} default_server;
+    server_name _;
+    root /var/www/status;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location = /health {
+      access_log off;
+      default_type text/plain;
+      return 200 "ok\n";
+    }
+
+    location / {
+      try_files $uri $uri/ =404;
+    }
+  }
+}
+NGINX
+
+mkdir -p /var/www/status
+cat > /var/www/status/index.html <<HTML
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>ops.baris.hu status</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 2rem; }
+    main { max-width: 40rem; margin: 0 auto; }
+    h1 { font-size: 1.5rem; }
+    .ok { color: #4ade80; }
+    dl { display: grid; grid-template-columns: max-content auto; gap: 0.5rem 1.5rem; }
+    dt { color: #94a3b8; }
+    dd { margin: 0; font-family: ui-monospace, monospace; }
+    footer { margin-top: 2rem; color: #64748b; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1><span class="ok">&#9679;</span> ops.baris.hu is up</h1>
+    <dl>
+      <dt>Instance ID</dt><dd>$INSTANCE_ID</dd>
+      <dt>Availability zone</dt><dd>$AZ</dd>
+      <dt>Instance type</dt><dd>$INSTANCE_TYPE</dd>
+      <dt>AMI</dt><dd>$AMI_ID</dd>
+      <dt>Booted at (UTC)</dt><dd>$BOOTED_AT</dd>
+    </dl>
+    <footer>Served by nginx on Amazon Linux 2023 behind an ALB. The page refreshes every 5 seconds; with more than one instance you will see the load balancer switch between them.</footer>
+  </main>
+</body>
+</html>
+HTML
+
+nginx -t
+systemctl enable --now nginx
+
+# --- CloudWatch agent (memory, disk, nginx logs) ---------------------------------
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s -c "ssm:${cw_agent_parameter}"
+
+echo "user-data finished at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
