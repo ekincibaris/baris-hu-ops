@@ -1,0 +1,305 @@
+schemaVersion: '0.3'
+description: |-
+  # Restart the web service on unhealthy ALB targets
+
+  Triggered by EventBridge when the target group's UnHealthyHostCount alarm enters ALARM.
+
+  1. **findUnhealthyInstances**: asks the target group which targets are unhealthy (the alarm does
+     not name an instance), keeps only InService members of the Auto Scaling group, and skips any
+     instance that is being patched right now.
+  2. **restartService**: restarts the service with Run Command. Output goes to CloudWatch Logs.
+  3. **verifyOrEscalate**: polls target health. Recovered targets are reported; targets that stay
+     unhealthy are marked Unhealthy in the Auto Scaling group, which replaces them.
+
+  Every step prints structured JSON logs (CloudWatch Logs via the SSM service setting) and the
+  final result is published to the alarm SNS topic.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: AWS::IAM::Role::Arn
+    description: Role the automation runs as.
+  TargetGroupArn:
+    type: String
+    description: ARN of the target group whose unhealthy targets are remediated.
+    allowedPattern: '^arn:aws[a-z-]*:elasticloadbalancing:[a-z0-9-]+:\d{12}:targetgroup/[A-Za-z0-9-]+/[a-f0-9]+$'
+  AutoScalingGroupName:
+    type: String
+    description: Auto Scaling group that owns the instances.
+    allowedPattern: '^[A-Za-z0-9._-]{1,255}$'
+  ServiceName:
+    type: String
+    description: systemd unit to restart.
+    default: nginx
+    allowedPattern: '^[A-Za-z0-9@._-]{1,64}$'
+  RunCommandLogGroup:
+    type: String
+    description: CloudWatch log group for Run Command output.
+    allowedPattern: '^[A-Za-z0-9/._-]{1,512}$'
+  NotificationTopicArn:
+    type: String
+    description: SNS topic that receives the remediation summary. Empty to disable.
+    default: ''
+  EscalateToReplace:
+    type: String
+    description: Mark instances Unhealthy in the Auto Scaling group if the restart does not fix them.
+    default: 'true'
+    allowedValues:
+      - 'true'
+      - 'false'
+  VerifyTimeoutSeconds:
+    type: Integer
+    description: How long to wait for the target to pass health checks again after the restart.
+    default: 120
+mainSteps:
+  - name: findUnhealthyInstances
+    action: aws:executeScript
+    description: Resolve which instances are unhealthy and safe to touch.
+    timeoutSeconds: 120
+    onFailure: Abort
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        TargetGroupArn: '{{ TargetGroupArn }}'
+        AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+      Script: |-
+        import json
+
+        import boto3
+
+
+        def log(event, **fields):
+            print(json.dumps({"step": "findUnhealthyInstances", "event": event, **fields}, default=str))
+
+
+        def handler(events, context):
+            tg_arn = events["TargetGroupArn"]
+            asg_name = events["AutoScalingGroupName"]
+            elbv2 = boto3.client("elbv2")
+            autoscaling = boto3.client("autoscaling")
+            ssm = boto3.client("ssm")
+
+            # The alarm only says "UnHealthyHostCount >= 1". The target group knows which one.
+            health = elbv2.describe_target_health(TargetGroupArn=tg_arn)["TargetHealthDescriptions"]
+            states = {d["Target"]["Id"]: d["TargetHealth"] for d in health}
+            log("target_health", targets={i: h.get("State") for i, h in states.items()})
+            unhealthy = sorted(i for i, h in states.items() if h.get("State") == "unhealthy")
+
+            restart, skipped = [], {}
+            if unhealthy:
+                members = autoscaling.describe_auto_scaling_instances(InstanceIds=unhealthy)
+                lifecycle = {m["InstanceId"]: m for m in members["AutoScalingInstances"]}
+                for instance_id in unhealthy:
+                    member = lifecycle.get(instance_id)
+                    if member is None or member["AutoScalingGroupName"] != asg_name:
+                        skipped[instance_id] = "not a member of " + asg_name
+                        continue
+                    if member["LifecycleState"] != "InService":
+                        # Launching, terminating or in standby: Auto Scaling owns it right now.
+                        skipped[instance_id] = "lifecycle state " + member["LifecycleState"]
+                        continue
+                    patching = ssm.list_command_invocations(
+                        InstanceId=instance_id,
+                        Filters=[
+                            {"key": "DocumentName", "value": "AWS-RunPatchBaseline"},
+                            {"key": "Status", "value": "InProgress"},
+                        ],
+                    )["CommandInvocations"]
+                    if patching:
+                        # A patch reboot looks exactly like an outage. Leave it to the maintenance window.
+                        skipped[instance_id] = "patching in progress (command " + patching[0]["CommandId"] + ")"
+                        continue
+                    restart.append(instance_id)
+
+            log("decision", restart=restart, skipped=skipped)
+            return {
+                "InstanceIds": restart,
+                "Count": len(restart),
+                "Summary": json.dumps({"restart": restart, "skipped": skipped}),
+            }
+    outputs:
+      - Name: InstanceIds
+        Selector: $.Payload.InstanceIds
+        Type: StringList
+      - Name: Count
+        Selector: $.Payload.Count
+        Type: Integer
+      - Name: Summary
+        Selector: $.Payload.Summary
+        Type: String
+    nextStep: anythingToRestart
+
+  - name: anythingToRestart
+    action: aws:branch
+    description: Stop here if no instance needs (or may receive) a restart.
+    inputs:
+      Choices:
+        - NextStep: restartService
+          Variable: '{{ findUnhealthyInstances.Count }}'
+          NumericGreater: 0
+      Default: nothingToDo
+
+  - name: nothingToDo
+    action: aws:executeScript
+    description: Record why no action was taken.
+    timeoutSeconds: 60
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        Summary: '{{ findUnhealthyInstances.Summary }}'
+        NotificationTopicArn: '{{ NotificationTopicArn }}'
+        AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+      Script: |-
+        import json
+
+        import boto3
+
+
+        def handler(events, context):
+            message = {
+                "step": "nothingToDo",
+                "result": "no eligible unhealthy instances",
+                "details": json.loads(events["Summary"]),
+            }
+            print(json.dumps(message))
+            if events.get("NotificationTopicArn"):
+                boto3.client("sns").publish(
+                    TopicArn=events["NotificationTopicArn"],
+                    Subject="[auto-remediation] " + events["AutoScalingGroupName"] + ": no action taken",
+                    Message=json.dumps(message, indent=2),
+                )
+            return message
+    outputs:
+      - Name: Result
+        Selector: $.Payload.result
+        Type: String
+
+  - name: restartService
+    action: aws:runCommand
+    description: Restart the service and run a local health check.
+    timeoutSeconds: 180
+    onFailure: Continue
+    isCritical: false
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds: '{{ findUnhealthyInstances.InstanceIds }}'
+      TimeoutSeconds: 60
+      Comment: 'auto-remediation: restart {{ ServiceName }}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: true
+        CloudWatchLogGroupName: '{{ RunCommandLogGroup }}'
+      Parameters:
+        executionTimeout: '90'
+        commands:
+          - set -uo pipefail
+          - 'echo "auto-remediation: restarting {{ ServiceName }} on $(hostname) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+          - 'echo "--- state before restart"; systemctl status {{ ServiceName }} --no-pager --lines=0 || true'
+          - 'echo "--- recent journal"; journalctl -u {{ ServiceName }} --no-pager -n 20 || true'
+          - systemctl restart {{ ServiceName }}
+          - sleep 3
+          - 'echo "--- state after restart"; systemctl is-active {{ ServiceName }}'
+          - 'curl -fsS -o /dev/null -w "local /health returned HTTP %{http_code}\n" http://127.0.0.1/health'
+    nextStep: verifyOrEscalate
+
+  - name: verifyOrEscalate
+    action: aws:executeScript
+    description: Wait for ALB health checks; hand persistent failures to Auto Scaling.
+    timeoutSeconds: 360
+    isEnd: true
+    inputs:
+      Runtime: python3.11
+      Handler: handler
+      InputPayload:
+        TargetGroupArn: '{{ TargetGroupArn }}'
+        AutoScalingGroupName: '{{ AutoScalingGroupName }}'
+        InstanceIds: '{{ findUnhealthyInstances.InstanceIds }}'
+        EscalateToReplace: '{{ EscalateToReplace }}'
+        VerifyTimeoutSeconds: '{{ VerifyTimeoutSeconds }}'
+        RunCommandLogGroup: '{{ RunCommandLogGroup }}'
+        NotificationTopicArn: '{{ NotificationTopicArn }}'
+      Script: |-
+        import json
+        import time
+
+        import boto3
+
+
+        def log(event, **fields):
+            print(json.dumps({"step": "verifyOrEscalate", "event": event, **fields}, default=str))
+
+
+        def handler(events, context):
+            tg_arn = events["TargetGroupArn"]
+            asg_name = events["AutoScalingGroupName"]
+            escalate = str(events["EscalateToReplace"]).lower() == "true"
+            deadline = time.time() + int(events["VerifyTimeoutSeconds"])
+            elbv2 = boto3.client("elbv2")
+            autoscaling = boto3.client("autoscaling")
+
+            pending = set(events["InstanceIds"])
+            recovered, gone = [], {}
+            log("start", instances=sorted(pending))
+
+            while pending and time.time() < deadline:
+                time.sleep(10)
+                health = elbv2.describe_target_health(TargetGroupArn=tg_arn)["TargetHealthDescriptions"]
+                states = {d["Target"]["Id"]: d["TargetHealth"]["State"] for d in health}
+                for instance_id in sorted(pending):
+                    state = states.get(instance_id, "deregistered")
+                    log("poll", instance_id=instance_id, state=state)
+                    if state == "healthy":
+                        recovered.append(instance_id)
+                        pending.discard(instance_id)
+                    elif state != "unhealthy":
+                        # draining / unused / deregistered: someone else is already replacing it.
+                        gone[instance_id] = state
+                        pending.discard(instance_id)
+
+            escalated, not_escalated = [], []
+            for instance_id in sorted(pending):
+                if escalate:
+                    # Restart did not help: let Auto Scaling replace the instance.
+                    autoscaling.set_instance_health(
+                        InstanceId=instance_id,
+                        HealthStatus="Unhealthy",
+                        ShouldRespectGracePeriod=True,
+                    )
+                    escalated.append(instance_id)
+                    log("escalated", instance_id=instance_id, action="SetInstanceHealth Unhealthy")
+                else:
+                    not_escalated.append(instance_id)
+
+            result = "recovered" if not pending else ("escalated" if escalated else "still_unhealthy")
+            summary = {
+                "result": result,
+                "auto_scaling_group": asg_name,
+                "restart_command_log_group": events["RunCommandLogGroup"],
+                "recovered": recovered,
+                "escalated_for_replacement": escalated,
+                "still_unhealthy_not_escalated": not_escalated,
+                "left_target_group": gone,
+            }
+            log("result", **summary)
+
+            if events.get("NotificationTopicArn"):
+                boto3.client("sns").publish(
+                    TopicArn=events["NotificationTopicArn"],
+                    Subject="[auto-remediation] " + asg_name + ": " + result,
+                    Message=json.dumps(summary, indent=2),
+                )
+            return summary
+    outputs:
+      - Name: Result
+        Selector: $.Payload.result
+        Type: String
+      - Name: Recovered
+        Selector: $.Payload.recovered
+        Type: StringList
+      - Name: Escalated
+        Selector: $.Payload.escalated_for_replacement
+        Type: StringList
+outputs:
+  - findUnhealthyInstances.Summary
+  - verifyOrEscalate.Result

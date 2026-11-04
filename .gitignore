@@ -1,0 +1,29 @@
+# Terraform working directories and state
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Account-specific and personal values never go to git.
+# Commit the *.example files instead.
+*.tfvars
+*.tfvars.json
+backend.hcl
+
+# Lock files are committed for root configurations (envs/*, bootstrap) only.
+modules/**/.terraform.lock.hcl
+
+# Tooling
+.tflint.d/
+.venv/
+__pycache__/
+.DS_Store
